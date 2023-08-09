@@ -34,17 +34,6 @@ df = pd.read_excel('DKSalaries.xlsx', sheet_name='Sheet1')  # Replace 'Sheet1' w
 # Convert the Starting and Relief Pitchers into one
 df['Position'] = df['Position'].replace({'RP': 'P', 'SP': 'P'})
 
-# Duplicate rows for players with two positions
-df_duplicate = df[df['Position'].str.contains('/')].copy()
-df_duplicate['Position'] = df_duplicate['Position'].str.split('/').str[1]
-
-# Update original df positions to the first position
-df.loc[df['Position'].str.contains('/'), 'Position'] = df['Position'].str.split('/').str[0]
-
-# Append the duplicated and updated rows to the original df
-df = df.append(df_duplicate, ignore_index=True)
-
-
 # ------------------------
 # Create the model
 model = LpProblem(name="optimal-lineup", sense=LpMaximize)
@@ -66,6 +55,15 @@ for position in set(positions_needed):
 # Add constraint so that each player can only be picked at most once
 model += lpSum([player_vars[i] for i in df.index]) <= 10
 
+# Add constraint for unique player IDs
+selected_ids = set()
+for i in df.index:
+    player_id = df.loc[i, 'ID']
+    if player_id in selected_ids:
+        model += player_vars[i] == 0
+    else:
+        selected_ids.add(player_id)
+
 # Solve the model
 status = model.solve()
 
@@ -74,4 +72,5 @@ print(f"Status: {LpStatus[model.status]}")
 
 # Get the players in the optimal lineup
 lineup = df.iloc[[i for i in df.index if player_vars[i].value() == 1]]
+lineup = lineup[lineup['Position'].isin(positions_needed)]
 print(lineup)
