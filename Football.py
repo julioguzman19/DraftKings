@@ -4,6 +4,7 @@ from pulp import LpMaximize, LpProblem, LpStatus, lpSum, LpVariable
 import requests
 from bs4 import BeautifulSoup
 import numpy as np
+from pulp import LpProblem, LpMaximize, LpVariable, LpBinary, lpSum, LpStatus
 
 #--------------------------------- Global Variables ---------------------------------
 DK_CSV_NAME = 'DKSalaries.csv'
@@ -31,12 +32,10 @@ position_stats_mapping = {
     },
     'dst': {
         'indices': [0, 1, 2, 6],
-        'columns': ['Sacks', 'Interceptions', 'FumbleRecover' 'PointsAllowed']
+        'columns': ['Sacks', 'Interceptions', 'FumbleRecover', 'PointsAllowed']
     }
 }
 
-POSITIONS_NEEDED = {'QB': 1, 'RB': 2, 'WR': 3, 'TE': 1, 'DST': 1}
-FLEX_POSITIONS = ['RB', 'WR', 'TE']
 #--------------------------------- Clean Up DK Excel Data ---------------------------------
 def clean_dk_excel_data(): 
     # Load your CSV
@@ -53,7 +52,7 @@ def clean_dk_excel_data():
     sheet = wb['Sheet1'] 
 
     # Define the columns you want to keep
-    columns_to_keep = ['Position', 'Name', 'ID', 'Salary']
+    columns_to_keep = ['Position', 'Name', 'ID', 'Salary', 'TeamAbbrev']
 
     # Get the max column count
     max_column = sheet.max_column
@@ -65,17 +64,43 @@ def clean_dk_excel_data():
             sheet.delete_cols(i)
 
     # Add new column headers
-    sheet['E1'] = 'PredictedPts'  # Assuming 'E' is the next empty column
-    sheet['F1'] = 'Required? (y/n)'
+    sheet['F1'] = 'PredictedPts'  # Assuming 'E' is the next empty column
+    sheet['G1'] = 'Include? (y/n)'
 
     # Fill all cells in column 'F' with 'n' except for the header
     max_row = sheet.max_row
     for row in range(2, max_row + 1):  # starting from 2 to skip the header
-        sheet[f'F{row}'] = 'n'
+        sheet[f'G{row}'] = 'NA'
 
     # Save the workbook
     wb.save(DK_EXCEL_NAME)
 
+#--------------------------------- Update players required or exclude from lineup ---------------------------------
+def user_update_players():
+    wb = load_workbook(DK_EXCEL_NAME)
+    sheet = wb['Sheet1']
+
+    while True:
+        player_name = input("\nType the name of the player you want to update (or type 'done' to proceed): ").strip()
+        if player_name.lower() == 'done':
+            break
+
+        found = False
+        for row in range(2, sheet.max_row + 1):  # start from 2 to skip the header
+            if sheet[f'B{row}'].value == player_name:  # assuming names are in column B
+                found = True
+                current_value = sheet[f'G{row}'].value
+                new_value = input(f"\nCurrent value for {player_name} is {current_value}. Include? (y/n): ").strip().lower()
+                while new_value not in ['y', 'n']:
+                    print("Invalid input. Please enter y or n or done.")
+                    new_value = input(f"\nCurrent value for {player_name} is {current_value}. Include? (y/n): ").strip().lower()
+                sheet[f'G{row}'].value = new_value
+                break
+
+        if not found:
+            print(f"\nPlayer named '{player_name}' not found. Please check the name and try again.")
+
+    wb.save(DK_EXCEL_NAME)
 #--------------------------------- SCRAPE & IMPORT DATA --------------------------------
 def scrape_position(position):
     url = BASE_URL.format(position)
@@ -132,15 +157,15 @@ def create_new_excel_sheet():
         # mode='a' means append mode, which ensures the existing content in the Excel file is not overwritten
         consolidated_df.to_excel(writer, sheet_name="Week1", index=False)
 
-#--------------------------------- Calculate Predicted Points ---------------------------------
-def calculate_predicted_points():
+#--------------------------------- Merge Data Before Calculating Predicted Points ---------------------------------
+def merge_data():
     # Load the Week1 and Sheet1 data
     df_week1 = pd.read_excel(DK_EXCEL_NAME, sheet_name='Week1')
     df_sheet1 = pd.read_excel(DK_EXCEL_NAME, sheet_name='Sheet1')
 
     # Strip whitespaces from the 'Name' column
     df_sheet1['Name'] = df_sheet1['Name'].str.strip()
-    
+
     # Merge dataframes early on to get all required columns together for point calculation
     merged_df = df_sheet1.merge(df_week1[['Player', 'PassYards', 'RushYards', 'ReceiveYards', 'PassTD', 'RushTD', 'ReceiveTD', 'Receptions', 'Interceptions', 'Sacks', 'FumbleRecover', 'PointsAllowed']], left_on='Name', right_on='Player', how='left')
 
@@ -149,6 +174,9 @@ def calculate_predicted_points():
     for col in columns_to_fill:
         merged_df[col].fillna(0, inplace=True)
 
+    return df_sheet1, merged_df
+#--------------------------------- Calculate Predicted Points ---------------------------------
+def calculate_predicted_points(df_sheet1, merged_df):
     # Calculate points based on conditions
     merged_df['predicted_points'] = (
         merged_df['PassYards'] * 0.04 + 
@@ -207,15 +235,34 @@ def optimize_lineup():
     # Add salary constraint
     model += lpSum([df.loc[i, 'Salary'] * player_vars[i] for i in df.index]) <= 50000
 
-    # Add position constraints
-    for position, count in POSITIONS_NEEDED.items():
-        model += lpSum([player_vars[i] for i in df[df['Position'] == position].index]) == count
+    # Define the positions and their needed counts
+    POSITIONS_NEEDED = {'QB': 1, 'RB': 2, 'WR': 3, 'TE': 1, 'DST': 1}
+    INCREASE_POSITIONS = ['RB', 'WR', 'TE']
 
-    # Handle the FLEX position separately
-    model += lpSum([player_vars[i] for i in df[df['Position'].isin(FLEX_POSITIONS)].index]) == sum(POSITIONS_NEEDED.values()) + 1  # +1 because of FLEX
+    # Create binary variables to denote if a position gets an additional player
+    INCREASE_RB = LpVariable("INCREASE_RB", 0, 1, LpBinary)
+    INCREASE_WR = LpVariable("INCREASE_WR", 0, 1, LpBinary)
+    INCREASE_TE = LpVariable("INCREASE_TE", 0, 1, LpBinary)
 
-    # Add constraint so that each player can only be picked at most once
-    model += lpSum([player_vars[i] for i in df.index]) <= 10
+    # Ensure only one position gets the additional player
+    model += INCREASE_RB + INCREASE_WR + INCREASE_TE == 1
+
+    # Constraints for positions that can have an additional player
+    model += lpSum([player_vars[i] for i in df[df['Position'] == 'RB'].index]) == POSITIONS_NEEDED['RB'] + INCREASE_RB
+    model += lpSum([player_vars[i] for i in df[df['Position'] == 'WR'].index]) == POSITIONS_NEEDED['WR'] + INCREASE_WR
+    model += lpSum([player_vars[i] for i in df[df['Position'] == 'TE'].index]) == POSITIONS_NEEDED['TE'] + INCREASE_TE
+
+    # Constraints for positions with a fixed count
+    fixed_positions = [p for p in POSITIONS_NEEDED if p not in INCREASE_POSITIONS]
+    for position in fixed_positions:
+        model += lpSum([player_vars[i] for i in df[df['Position'] == position].index]) == POSITIONS_NEEDED[position]
+
+    # Constraint for excluding or including specific players based on user choice
+    for idx, row in df.iterrows():
+        if row['Include? (y/n)'] == 'y':
+            model += player_vars[idx] == 1
+        elif row['Include? (y/n)'] == 'n':
+            model += player_vars[idx] == 0
 
     # Add constraint for unique player IDs
     selected_ids = set()
@@ -238,5 +285,8 @@ def optimize_lineup():
     print(lineup)
 #--------------------------------- Call Helper Methods ---------------------------------
 clean_dk_excel_data()
+user_update_players()
 create_new_excel_sheet()
-calculate_predicted_points()
+df_sheet1, merged_df = merge_data()
+calculate_predicted_points(df_sheet1, merged_df)
+optimize_lineup()
