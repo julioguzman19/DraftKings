@@ -57,6 +57,13 @@ def clean_dk_excel_data():
     # Get the max column count
     max_column = sheet.max_column
 
+    # Trim whitespace for all cells
+    for row in range(1, sheet.max_row + 1):
+        for col in range(1, max_column + 1):
+            cell = sheet.cell(row=row, column=col)
+            if cell.value and isinstance(cell.value, str):  # Check if cell has a value and it's a string
+                cell.value = cell.value.rstrip()  # trim the right whitespace
+
     # Traverse in reverse order (to avoid index change problem during deletion)
     for i in range(max_column, 0, -1):
         # If the column header is not in columns_to_keep list, delete it
@@ -84,9 +91,8 @@ def user_update_players():
         player_name = input("\nType the name of the player you want to update (or type 'done' to proceed): ").strip()
         if player_name.lower() == 'done':
             break
-
         found = False
-        for row in range(2, sheet.max_row + 1):  # start from 2 to skip the header
+        for row in range(2, sheet.max_row +1):  # start from 2 to skip the header
             if sheet[f'B{row}'].value == player_name:  # assuming names are in column B
                 found = True
                 current_value = sheet[f'G{row}'].value
